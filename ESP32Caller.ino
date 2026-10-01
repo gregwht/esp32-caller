@@ -136,7 +136,7 @@ void loadSettings() {
   
     Serial.print("Slot ");
     Serial.print(i);
-    Serial.print(": start=")
+    Serial.print(": start=");
     Serial.print(timeslots[i].startTime);
     Serial.print(" duration=");
     Serial.print(timeslots[i].duration);
