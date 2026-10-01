@@ -16,7 +16,7 @@ Preferences prefs;     // Set up Preferences (for storing information in flash s
 struct Timeslot {
   String startTime;    // e.g. "09:00"
   uint16_t duration;   // in minutes 
-}
+};
 
 const uint8_t MAX_SLOTS = 10;  // Arbitrarily set to 10, increase if more timeslots are needed
 Timeslot timeslots[MAX_SLOTS];
@@ -123,7 +123,7 @@ void loadSettings() {
   printTimestamp();
   Serial.println("Current Settings:");
 
-  for (uint8_t i = 0; o < numSlots; i++) {
+  for (uint8_t i = 0; i < numSlots; i++) {
     String timeKey = "time" + String(i);
     String durKey = "duration" + String(i);
 
@@ -136,7 +136,7 @@ void loadSettings() {
   
     Serial.print("Slot ");
     Serial.print(i);
-    Serial.print(": start=";)
+    Serial.print(": start=")
     Serial.print(timeslots[i].startTime);
     Serial.print(" duration=");
     Serial.print(timeslots[i].duration);
@@ -345,7 +345,7 @@ uint16_t timeStringToMinutes(const String& time) {
 bool isWithinSlot(const Timeslot& slot, uint16_t nowMinutes){
 
   uint16_t start = timeStringToMinutes(slot.startTime);
-  uint16_t end = start.slot.duration;
+  uint16_t end = start + slot.duration;
 
   // For a slot running 24 hours a day
   if (slot.duration >= 1440) {
