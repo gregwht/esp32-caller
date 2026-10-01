@@ -4,6 +4,15 @@
 #include <Preferences.h>
 #include <ArduinoJson.h>
 #include <Melopero_RV3028.h>
+#include "esp_sleep.h"
+#include "driver/gpio.h"
+
+// Deep sleep settings
+const unsigned long CONFIG_TIMEOUT_MS = 5 * 60UL * 1000UL;  // Go back to sleep after 5 mins of no activity in config mode
+const int rtcIntPin = 5;  // RV3028 INT pin - wake-capable on the ESP32-C3 (GPIO2-5 only)
+const uint64_t SAFETY_NET_SECONDS = 3600; // Back-up wake in case the RTC alarm logic ever misses
+
+unsigned long configModeStart = 0; // Tracks how long config mode has been active
 
 // Global objects
 WebServer server(80);  // Web Server
@@ -47,19 +56,62 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
-  // Initialise RTC clock
+  // Understand why ESP32 woke up
+  esp_sleep_wakeup_cause_t wakeupReason = esp_sleep_get_wakeup_cause();
+
+  // If a GPIO caused the wake, find out which one(s)
+  // This lets us tell the RTC alarm apart from the button, since both wake via the same mechanism
+  uint64_t wakeGpioMask = 0;
+  if (wakeupReason == ESP_SLEEP_WAKEUP_GPIO){
+    wakeGpioMask = esp_sleep_get_gpio_wakeup_status();
+  }
+  bool wokenByButton = wakeGpioMask & (1ULL << buttonPin);
+  bool wokenByRtcAlarm = wakeGpioMask & (1ULL << rtcIntPin);
+  bool wokenBySafetyNet = (wakeupReason == ESP_SLEEP_WAKEUP_TIMER);
+
+  // Release the hold placed on the speaker pin before the last deep sleep, so we can drive it again.
+  // Harmless to call even on a fresh power-on (nothing held yet).
+  gpio_hold_dis((gpio_num_t)speakerPowerPin);
+
+  // Prepare pins (needed on every boot)
+  pinMode(buttonPin, INPUT_PULLUP);
+  pinMode(rtcIntPin, INPUT_PULLUP); // RV3028's INT is open-drain, active LOW, pulled high on the module
+  pinMode(speakerPowerPin, OUTPUT);
+  // We don't digitalWrite here because checkSchedule(), called below, sets this pin
+  // based on the schedule, rather than blindly forcing it off on every wake
+
+  // Initialise RTC clock (needed on every boot)
   Wire.begin(0, 1);
   rtc.initI2C();
   rtc.set24HourMode();
+
+  // Clear the RTC's alarm flag now before it has a chance to re-trigger
+  // The INT pin stays LOW until this happens, which would otherwise wake the ESP32 again immediately
+  rtc.clearInterruptFlags();
+
+  // Load stored time and duration settings (needed on every boot)
+  loadSettings();
+
+  if (wokenByRtcAlarm || wokenBySafetyNet) {
+    // Woken just to act on the schedule: do the minimum, then go straight back to sleep
+    printTimestamp();
+    Serial.println(wokenByRtcAlarm ? "Woke from RTC alarm - checking schedule" : "Woke from safety-net timer - checking schedule");
+    checkSchedule();
+    goToSleep();
+    return;
+  }
+  // Otherwise if first power on, or woken by the button, enter config mode
+  printTimestamp();
+  Serial.println("Entering configuration mode");
+
+  // Also apply the schedule immediately, in case we're waking into the middle of an active timeslot
+  checkSchedule();
 
   // Start LittleFS so web files can be read
   if (!LittleFS.begin()) {
     Serial.println("LittleFS failed to mount");
     return;
   }
-
-  // Load stored time and duration settings
-  loadSettings();
 
   // Configure WiFi, server, load web files
   prepareWeb();
@@ -79,10 +131,8 @@ void setup() {
   Serial.println("Web server started.");
   Serial.println();
 
-  // Prepare pins
-  pinMode(buttonPin, INPUT_PULLUP);
-  pinMode(speakerPowerPin, OUTPUT);
-  digitalWrite(speakerPowerPin, LOW); // LOW prevents speaker powering on when ESP32 starts
+  // Start (or restart) the inactivity timer for config mode
+  configModeStart = millis();
 }
 
 void loop() {
@@ -91,10 +141,11 @@ void loop() {
 
   checkSchedule();
 
-  // Button logic
+  // Button logic - pressing it while awake resets the inactivity timer.
+  // This means the device can be kepy awake by pressing the button occasionally
   if (digitalRead(buttonPin) == LOW) {
-    Serial.println("Button pressed!");
-    startConfigurationMode();
+    Serial.println("Button pressed -- staying awake");
+    configModeStart = millis();
 
     // Wait until button is released
     while (digitalRead(buttonPin) == LOW) {
@@ -102,12 +153,86 @@ void loop() {
     }
   }
 
+  // Go back to sleep once nothing has happened for CONFIG_TIMEOUT_MS
+  if (millis() - configModeStart > CONFIG_TIMEOUT_MS) {
+    Serial.println("Config mode timed out - going back to sleep");
+    goToSleep();
+  }
+
   delay(10);
 }
 
-void startConfigurationMode() {
-  Serial.println("Configuration Mode activated.");
+// Finds how many minutes from now until the next timeslot start or end,
+// across all active slots (for RTC alarm)
+uint16_t minutesUntilNextTransition(uint16_t nowMinutes) {
+
+  uint16_t best = 1440; // default to a full day away
+
+  for (uint8_t i = 0; i < numSlots; i++) {
+    uint16_t start = timeStringToMinutes(timeslots[i].startTime);
+    uint16_t end = (start + timeslots[i].duration) % 1440;
+
+    uint16_t deltaStart = (start + 1440 - nowMinutes) % 1440;
+    if (deltaStart == 0) deltaStart = 1440; // already at this boundary, next one is a day away
+    if (deltaStart < best) best = deltaStart;
+
+    if (timeslots[i].duration > 0 && timeslots[i].duration < 1440) {
+      uint16_t deltaEnd = (end + 1440 - nowMinutes) % 1440;
+      if (deltaEnd == 0) deltaEnd = 1440;
+      if (deltaEnd < best) best = deltaEnd;
+    }
+  }
+
+  return best;
 }
+  
+void goToSleep() {
+
+  printTimestamp();
+  Serial.println("Going to deep sleep...goodnight");
+
+  // Make sure the speaker is left in the correct state before sleeping
+  digitalWrite(speakerPowerPin, speakerOn ? HIGH : LOW);
+
+  // Hold that output level through deep sleep
+  // Without this the pin's state isn't guaranteed to survive sleep, which could cut the speaker off mid-timeslot
+  gpio_hold_en((gpio_num_t)speakerPowerPin);
+  gpio_deep_sleep_hold_en();
+
+  // Work out exactly when the next timeslot starts or ends,
+  // and ask the RTC to raise its INT pin at that moment
+  CurrentTime now = getCurrentTime();
+  uint16_t minutesAhead = minutesUntilNextTransition(now.minutesSinceMidnight);
+  uint16_t nextEventMinutes = (now.minutesSinceMidnight + minutesAhead) % 1440;
+  uint8_t alarmHour = nextEventMinutes / 60;
+  uint8_t alarmMinute = nextEventMinutes % 60;
+
+  Serial.print("Arming RTC alarm for ");
+  if (alarmHour < 10) Serial.print("0");
+  Serial.print(alarmHour);
+  Serial.print(":");
+  if (alarmMinute < 10) Serial.print("0");
+  Serial.println(alarmMinute);
+  Serial.flush();
+
+  // Match on hour + minute every day, ignoring weekday/date entirely (dateAlarm=false)
+  // and generate an interrupt on the INT pin when it fires
+  rtc.setDateModeForAlarm(false); // weekday mode -- irrelevant since dateAlarm is disabled below
+  rtc.enableAlarm(0, alarmHour, alarmMinute, false, true, true, true);
+
+  // Wake source 1: the RTC alarm (primary) and the button (for config mode)
+  // Both active LOW
+  uint64_t wakePinMask = (1ULL << buttonPin) | (1ULL << rtcIntPin);
+  esp_deep_sleep_enable_gpio_wakeup(wakePinMask, ESP_GPIO_WAKEUP_GPIO_LOW);
+
+  // Wake source 2: a long-interval safety net in case the alarm is every misconfigured
+  // (Should rarely activate, if ever)
+  esp_sleep_enable_timer_wakeup(SAFETY_NET_SECONDS * 1000000ULL);
+
+  esp_deep_sleep_start();
+  // Execution never returns here -- the next line of code to run is setup(), after waking
+}
+
 
 void loadSettings() {
 
